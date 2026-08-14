@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Xiamu-ssr/codex-hybrid-router/blob/main/config.schema.json",
+  "title": "Codex Hybrid Router configuration",
+  "type": "object",
+  "required": ["external_provider", "external_models", "hybrid_final_models"],
+  "properties": {
+    "version": { "const": 1 },
+    "catalog_template_model": { "type": "string" },
+    "external_provider": {
+      "type": "object",
+      "required": ["name", "base_url"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "base_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "api_key_env": { "type": "string" },
+        "keychain_service": { "type": "string" },
+        "keychain_account": { "type": "string" },
+        "send_authorization": { "type": "boolean" },
+        "send_x_api_key": { "type": "boolean" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        }
+      },
+      "additionalProperties": false
+    },
+    "external_models": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/externalModel" }
+    },
+    "hybrid_final_models": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/hybridModel" }
+    }
+  },
+  "$defs": {
+    "catalogMetadata": {
+      "type": "object",
+      "properties": {
+        "display_name": { "type": "string" },
+        "description": { "type": "string" },
+        "priority": { "type": "integer" },
+        "context_window": { "type": "integer", "minimum": 1 },
+        "max_context_window": { "type": "integer", "minimum": 1 },
+        "auto_compact_token_limit": { "type": "integer", "minimum": 1 },
+        "effective_context_window_percent": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "default_reasoning_level": { "type": "string" },
+        "reasoning_levels": { "type": "array", "items": { "type": "string" } },
+        "supports_search_tool": { "type": "boolean" },
+        "disable_apply_patch_tool": { "type": "boolean" }
+      }
+    },
+    "externalModel": {
+      "allOf": [
+        { "$ref": "#/$defs/catalogMetadata" },
+        {
+          "type": "object",
+          "required": ["upstream_model"],
+          "properties": {
+            "upstream_model": { "type": "string", "minLength": 1 },
+            "compatibility": { "enum": ["generic", "claude", "kimi", "grok"] }
+          }
+        }
+      ]
+    },
+    "hybridModel": {
+      "allOf": [
+        { "$ref": "#/$defs/catalogMetadata" },
+        {
+          "type": "object",
+          "required": ["agent_model", "finalizer_model"],
+          "properties": {
+            "agent_model": { "type": "string", "minLength": 1 },
+            "agent_service_tier": { "type": "string" },
+            "finalizer_model": { "type": "string", "minLength": 1 },
+            "finalizer_compatibility": { "enum": ["generic", "claude", "kimi", "grok"] }
+          }
+        }
+      ]
+    }
+  }
+}

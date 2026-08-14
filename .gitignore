@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+node_modules/
+coverage/
+*.log
+compact-secret
+router.mjs.bak*
+router.mjs.before-*
+update-model-catalog.mjs.before-*
+reload-router-once.sh
+config.local.json
+*.before-hybrid-router-*

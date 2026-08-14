@@ -1,0 +1,20 @@
+{
+  "name": "codex-hybrid-router",
+  "version": "0.1.0",
+  "description": "Local Codex router that preserves native ChatGPT subscription traffic while adding OpenAI Responses-compatible models and hybrid final answers.",
+  "private": false,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "check": "node --check router.mjs && node --check update-model-catalog.mjs && node --check scripts/patch-codex-config.mjs && node --check scripts/write-launch-agent.mjs",
+    "install:macos": "./scripts/install-macos.sh",
+    "key:macos": "./scripts/store-key-macos.sh"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}
