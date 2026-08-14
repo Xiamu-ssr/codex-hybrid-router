@@ -18,6 +18,26 @@ if (!Array.isArray(catalog.models)) {
 
 const externalDefinitions = Object.entries(config.external_models || {});
 const hybridDefinitions = Object.entries(config.hybrid_final_models || {});
+const configuredSlugs = new Set(
+  [...externalDefinitions, ...hybridDefinitions].map(([slug]) => slug),
+);
+
+function writeCatalog() {
+  const temporaryPath = `${catalogPath}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(catalog, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  fs.renameSync(temporaryPath, catalogPath);
+}
+
+if (process.argv.includes("--remove")) {
+  const before = catalog.models.length;
+  catalog.models = catalog.models.filter((model) => !configuredSlugs.has(model.slug));
+  writeCatalog();
+  process.stdout.write(`Removed ${before - catalog.models.length} router model entries.\n`);
+  process.exit(0);
+}
+
 if (externalDefinitions.length === 0 && hybridDefinitions.length === 0) {
   throw new Error(`${configPath} defines no models`);
 }
@@ -159,11 +179,7 @@ catalog.models = catalog.models
   .concat(hybridModels, externalModels)
   .sort((left, right) => left.priority - right.priority);
 
-const temporaryPath = `${catalogPath}.tmp`;
-fs.writeFileSync(temporaryPath, `${JSON.stringify(catalog, null, 2)}\n`, {
-  mode: 0o600,
-});
-fs.renameSync(temporaryPath, catalogPath);
+writeCatalog();
 
 process.stdout.write(
   `${[...hybridModels, ...externalModels].map((model) => model.slug).join("\n")}\n`,

@@ -53,8 +53,45 @@ const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
 assert(catalog.models.some((model) => model.slug === "zenmux/claude-opus-5"));
 assert(catalog.models.some((model) => model.slug === "hybrid/gpt-5.6-sol-claude-final"));
 
+const removeCatalogEntries = spawnSync(
+  process.execPath,
+  [path.join(root, "update-model-catalog.mjs"), "--remove"],
+  {
+    env: {
+      ...process.env,
+      CODEX_ROUTER_CONFIG: configPath,
+      CODEX_MODEL_CATALOG: catalogPath,
+    },
+    encoding: "utf8",
+  },
+);
+assert.equal(removeCatalogEntries.status, 0, removeCatalogEntries.stderr);
+const cleanedCatalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+assert(!cleanedCatalog.models.some((model) => model.slug === "zenmux/claude-opus-5"));
+assert(!cleanedCatalog.models.some((model) => model.slug.startsWith("hybrid/")));
+
+const reinstallCatalogEntries = spawnSync(
+  process.execPath,
+  [path.join(root, "update-model-catalog.mjs")],
+  {
+    env: {
+      ...process.env,
+      CODEX_ROUTER_CONFIG: configPath,
+      CODEX_MODEL_CATALOG: catalogPath,
+    },
+    encoding: "utf8",
+  },
+);
+assert.equal(reinstallCatalogEntries.status, 0, reinstallCatalogEntries.stderr);
+
 const codexConfigPath = path.join(temporary, "config.toml");
-fs.writeFileSync(codexConfigPath, 'personality = "pragmatic"\n');
+const originalConfig = [
+  'personality = "pragmatic"',
+  'model_provider = "previous-provider"',
+  'openai_base_url = "https://previous.example/v1"',
+  "",
+].join("\n");
+fs.writeFileSync(codexConfigPath, originalConfig);
 const patchConfig = spawnSync(
   process.execPath,
   [path.join(root, "scripts", "patch-codex-config.mjs")],
@@ -69,6 +106,51 @@ assert.match(patchedConfig, /^forced_login_method = "chatgpt"$/m);
 assert.match(patchedConfig, /^model_provider = "openai"$/m);
 assert.match(patchedConfig, /^openai_base_url = "http:\/\/127\.0\.0\.1:19123\/v1"$/m);
 assert.match(patchedConfig, /^personality = "pragmatic"$/m);
+assert(fs.existsSync(path.join(temporary, "hybrid-router-install-state.json")));
+
+const unpatchConfig = spawnSync(
+  process.execPath,
+  [path.join(root, "scripts", "patch-codex-config.mjs"), "--uninstall"],
+  {
+    env: { ...process.env, CODEX_HOME: temporary, CODEX_ROUTER_PORT: "19123" },
+    encoding: "utf8",
+  },
+);
+assert.equal(unpatchConfig.status, 0, unpatchConfig.stderr);
+const restoredConfig = fs.readFileSync(codexConfigPath, "utf8");
+assert.match(restoredConfig, /^model_provider = "previous-provider"$/m);
+assert.match(restoredConfig, /^openai_base_url = "https:\/\/previous\.example\/v1"$/m);
+assert.doesNotMatch(restoredConfig, /^forced_login_method\s*=/m);
+assert.doesNotMatch(restoredConfig, /^model_catalog_json\s*=/m);
+assert(!fs.existsSync(path.join(temporary, "hybrid-router-install-state.json")));
+
+const repatchConfig = spawnSync(
+  process.execPath,
+  [path.join(root, "scripts", "patch-codex-config.mjs")],
+  {
+    env: { ...process.env, CODEX_HOME: temporary, CODEX_ROUTER_PORT: "19123" },
+    encoding: "utf8",
+  },
+);
+assert.equal(repatchConfig.status, 0, repatchConfig.stderr);
+const manuallyChangedConfig = fs.readFileSync(codexConfigPath, "utf8").replace(
+  /^openai_base_url = .*$/m,
+  'openai_base_url = "https://user-changed.example/v1"',
+);
+fs.writeFileSync(codexConfigPath, manuallyChangedConfig);
+const safeUnpatchConfig = spawnSync(
+  process.execPath,
+  [path.join(root, "scripts", "patch-codex-config.mjs"), "--uninstall"],
+  {
+    env: { ...process.env, CODEX_HOME: temporary, CODEX_ROUTER_PORT: "19123" },
+    encoding: "utf8",
+  },
+);
+assert.equal(safeUnpatchConfig.status, 0, safeUnpatchConfig.stderr);
+assert.match(
+  fs.readFileSync(codexConfigPath, "utf8"),
+  /^openai_base_url = "https:\/\/user-changed\.example\/v1"$/m,
+);
 
 const plistPath = path.join(temporary, "dev.codex-hybrid-router.plist");
 const writePlist = spawnSync(

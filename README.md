@@ -1,44 +1,27 @@
 # Codex Hybrid Router
 
-An experimental local router for Codex Desktop and Codex CLI. It keeps native GPT models on the signed-in ChatGPT subscription path while adding models from an OpenAI Responses-compatible provider to the same Codex model picker.
-
-It also supports a hybrid model: GPT runs the Codex agent/tool loop, then an external model independently writes the final user-facing answer.
-
-> This is an unofficial community project. It relies on Codex and ChatGPT behavior that can change without notice. It is designed for one user on one machine, not subscription sharing.
-
-## What it does
+给 Codex Desktop / CLI 增加第三方模型，同时保留 ChatGPT 订阅登录和原生 GPT 模型。
 
 ```text
-Codex Desktop / CLI
-        |
-        v
-127.0.0.1:10100
-        |
-        +-- native GPT ----------> ChatGPT Codex WebSocket
-        |
-        +-- external/* ----------> provider /responses over HTTP/SSE
-        |
-        +-- hybrid/* ------------> GPT tool loop -> external final answer
+Codex -> 本机 127.0.0.1:10100
+          ├─ GPT          -> ChatGPT 订阅
+          ├─ external/*   -> 第三方 Responses API
+          └─ hybrid/*     -> GPT 执行工具，第三方模型写最终回复
 ```
 
-- Native GPT requests keep the built-in `openai` provider, ChatGPT login, Responses WebSocket transport, and native compaction. Ordinary native WebSocket request frames are forwarded byte-for-byte.
-- External models use a configurable HTTPS base URL, API key, model mapping, and compatibility profile.
-- External/hybrid compaction creates a portable summary with a configured GPT subscription model because provider-specific reasoning/compaction artifacts are not portable.
-- A hybrid request sends protocol-level WebSocket pings while a buffered model call is running, preventing Codex's stream idle timeout from turning a long inference into a false reconnect.
-- If the hybrid finalizer fails, the already completed GPT answer is returned instead.
+> 非官方实验项目，仅适合单人、本机使用。不要用于账号共享或搭建多人网关。
 
-Codex officially supports `model_provider`, custom provider `base_url`, API-key environment variables, the Responses wire protocol, and provider WebSocket capability flags. This project deliberately keeps `model_provider = "openai"` and routes locally so ChatGPT subscription authentication remains available. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+## 适合谁
 
-## Requirements
+- 已在 Codex 登录 ChatGPT 订阅；
+- 想在同一个模型列表里试用 Claude、Kimi、Grok 等第三方模型；
+- 有第三方供应商 API Key，能接受本地代理和兼容性风险。
 
-- macOS for the included installer and Keychain helper
-- Node.js 22 or newer
-- Codex Desktop or CLI already signed in with ChatGPT
-- An external provider exposing an OpenAI-compatible `POST /responses` SSE endpoint
+如果只用 OpenAI API Key、需要多人共享，或不能接受 Codex 更新后偶尔要修兼容性，不建议使用。
 
-The Node router can run on other operating systems, but service installation is currently manual there.
+## 安装（macOS）
 
-## Quick start: ZenMux preset
+需要 Node.js 22+，并先打开一次 Codex 完成 ChatGPT 登录。
 
 ```bash
 git clone https://github.com/Xiamu-ssr/codex-hybrid-router.git
@@ -50,9 +33,9 @@ npm ci
 ./scripts/install-macos.sh
 ```
 
-Restart Codex. The configured external and hybrid models should appear in the model picker while native GPT models continue to use the ChatGPT subscription.
+重启 Codex 后，第三方和混合模型会出现在模型列表中。默认配置是 ZenMux；其他供应商只需修改 [`config.example.json`](./config.example.json) 对应字段。
 
-If ZenMux requires Clash on your network, install with explicit proxy variables:
+需要显式经过 Clash 时：
 
 ```bash
 CODEX_ROUTER_PROXY_HOST=127.0.0.1 \
@@ -60,69 +43,51 @@ CODEX_ROUTER_PROXY_PORT=7890 \
 ./scripts/install-macos.sh
 ```
 
-Without those variables the router connects directly. It does not silently inherit a system proxy.
+不传代理变量时直接联网，不会自动继承系统代理。
 
-## Use another provider
+## 会修改什么
 
-Edit `~/.codex/hybrid-router.json`:
+| 位置 | 改动 |
+|---|---|
+| `~/.codex/config.toml` | 设置 `forced_login_method`、`model_provider`、`openai_base_url`、`model_catalog_json`；安装前备份，并记录原值供卸载恢复 |
+| `~/.codex/model-catalog.json` | 增加第三方/混合模型条目；安装前备份 |
+| `~/.codex/hybrid-router.json` | 保存供应商和模型配置，不保存明文 API Key |
+| macOS Keychain | 保存第三方供应商 API Key |
+| `~/Library/LaunchAgents/dev.codex-hybrid-router.plist` | 让本地路由器登录后自动运行 |
+| `~/.codex/hybrid-router.log` | 本地运行日志 |
+| `~/.codex/zenmux-router/compact-secret` | 本地可迁移压缩摘要的签名密钥；名称是历史遗留，供应商不限 ZenMux |
 
-```json
-{
-  "external_provider": {
-    "name": "My Provider",
-    "base_url": "https://provider.example/v1",
-    "api_key_env": "MY_PROVIDER_API_KEY",
-    "keychain_service": "dev.codex-hybrid-router.my-provider",
-    "send_authorization": true,
-    "send_x_api_key": false,
-    "headers": {}
-  },
-  "external_models": {
-    "external/my-model": {
-      "upstream_model": "vendor/model-id",
-      "compatibility": "generic",
-      "display_name": "My Model",
-      "context_window": 200000,
-      "auto_compact_token_limit": 180000,
-      "default_reasoning_level": "high",
-      "reasoning_levels": ["low", "medium", "high"]
-    }
-  },
-  "hybrid_final_models": {}
-}
+它**不会修改或删除** `~/.codex/auth.json`、Codex 会话文件和 ChatGPT 登录态。原生 GPT 仍消耗你的 ChatGPT 订阅，不会改成第三方 API Key。
+
+Codex 官方支持用户级 `model_provider`、`openai_base_url` 和 `model_catalog_json` 配置；本项目用本机入口完成分流。参见 [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
+
+## 风险
+
+- 安装期间，原生 GPT 流量也要经过本地路由器；路由器退出或端口被占用时，Codex 会请求失败。
+- 使用第三方/混合模型时，当前提示词、对话和工具结果可能发送给第三方，并消耗其额度。
+- 第三方模型的工具、推理、搜索和压缩兼容性取决于供应商；“兼容 OpenAI”不代表支持全部 Codex 行为。
+- 第三方会话的可迁移压缩可能调用 ChatGPT 订阅模型；Codex 或 ChatGPT 内部协议更新可能造成暂时不可用。
+- 本机端口会处理登录令牌，必须保持绑定 `127.0.0.1`，不要暴露到局域网或互联网。
+
+## 卸载
+
+```bash
+./scripts/uninstall-macos.sh
 ```
 
-Then rerun the key helper and installer. Supported compatibility values are:
+卸载会停止并删除 LaunchAgent、移除新增模型、撤销本地代理入口，并在未被你手动改写的前提下恢复安装前的 Codex 配置。重启 Codex 后生效。
 
-- `generic`: pass ordinary Responses fields through.
-- `claude`: remove assistant-progress prefill and translate maximum reasoning to adaptive thinking for gateways that expose current Claude models through Responses.
-- `kimi`: cap unsupported `ultra` effort at `max`.
-- `grok`: cap reasoning at `high` and remove unsupported namespace tools.
+为方便重装，以下内容默认保留：ChatGPT 登录、第三方 Key、路由配置、日志和备份。确认不再需要时可选清理：
 
-Provider compatibility varies. A gateway may claim OpenAI compatibility while rejecting Codex-specific tools, reasoning items, hosted search, compaction, or assistant-message shapes. Add one model at a time and run the integration checks.
+```bash
+rm -f ~/.codex/hybrid-router.json ~/.codex/hybrid-router.log
+rm -rf ~/.codex/zenmux-router
+security delete-generic-password -s dev.codex-hybrid-router.zenmux
+```
 
-## Configuration
+最后一条 Keychain 服务名需与 `hybrid-router.json` 中的 `keychain_service` 一致。
 
-Router configuration defaults to `~/.codex/hybrid-router.json`. Override it with `CODEX_ROUTER_CONFIG`.
-The repository includes [`config.schema.json`](./config.schema.json) for editor validation and autocomplete.
-
-Useful environment variables:
-
-| Variable | Default | Meaning |
-|---|---:|---|
-| `CODEX_ROUTER_HOST` | `127.0.0.1` | Local bind address; do not make this public |
-| `CODEX_ROUTER_PORT` | `10100` | Local port |
-| `CODEX_ROUTER_PROXY_HOST` | empty | Optional HTTP CONNECT proxy host |
-| `CODEX_ROUTER_PROXY_PORT` | empty | Optional HTTP CONNECT proxy port |
-| `CODEX_ROUTER_COMPACT_MODEL` | `gpt-5.6-luna` | Native GPT model used for portable summaries |
-| `CODEX_ROUTER_HYBRID_KEEPALIVE_MS` | `30000` | Hybrid WS ping interval |
-| `CODEX_ROUTER_MODEL_CATALOG` | `~/.codex/model-catalog.json` | Catalog served to Codex |
-
-API keys are read lazily from the configured environment variable, then from macOS Keychain. The JSON file never needs to contain the key.
-
-## Validation
-
-Offline checks:
+## 开发检查
 
 ```bash
 npm test
@@ -130,32 +95,7 @@ npm run check
 npm audit --omit=dev
 ```
 
-Authenticated integration checks use the local `~/.codex/auth.json` without printing its tokens:
-
-```bash
-node selftest.mjs gpt-5.6-luna
-node selftest-hybrid-final.mjs
-node selftest-compact.mjs
-```
-
-These calls can consume ChatGPT subscription or external-provider quota.
-
-## Important boundaries
-
-- The router is loopback-only by default, but it still handles bearer tokens in memory. Do not expose its port.
-- Native GPT transparency applies to ordinary native turns. When a conversation crosses provider boundaries, the router may remove unresolvable third-party reasoning IDs or restore a locally signed portable compaction summary.
-- External and hybrid turns may send the full active conversation, instructions, and tool results to the external provider.
-- Hybrid finalization is not a second agent loop: the finalizer receives completed context and cannot execute new client-side tools. Hosted provider-side web search may still be allowed.
-- The installer backs up Codex config and model catalog, but uninstall intentionally does not overwrite later user changes.
-- Codex model-catalog formats and ChatGPT internal endpoints are not a stable public contract. Test after Codex updates.
-
-## Uninstall
-
-```bash
-./scripts/uninstall-macos.sh
-```
-
-Restore the desired `~/.codex/*.before-hybrid-router-*` backups and restart Codex.
+需要真实账号的 `selftest-*.mjs` 会消耗 ChatGPT 订阅或第三方额度，不属于默认测试。
 
 ## License
 
