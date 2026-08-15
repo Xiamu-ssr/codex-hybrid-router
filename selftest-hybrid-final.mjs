@@ -42,11 +42,14 @@ const common = {
 socket.once("open", () => {
   socket.send(JSON.stringify({
     ...common,
-    instructions: "Reply with exactly HYBRID_FINAL_OK and nothing else.",
+    instructions:
+      "This is a two-stage handoff test. If the latest user message asks you to finalize " +
+      "an immediately preceding assistant draft whose complete text is SOL_DRAFT_VISIBLE, " +
+      "reply with exactly HYBRID_FINAL_OK. Otherwise reply with exactly SOL_DRAFT_VISIBLE.",
     input: [{
       type: "message",
       role: "user",
-      content: [{ type: "input_text", text: "Reply with exactly HYBRID_FINAL_OK" }],
+      content: [{ type: "input_text", text: "Start the two-stage handoff test." }],
     }],
     tools: [],
     tool_choice: "none",

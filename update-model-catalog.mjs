@@ -143,7 +143,7 @@ const hybridModels = hybridDefinitions.map(([slug, definition], index) => {
     display_name: definition.display_name || slug,
     description:
       definition.description ||
-      `${definition.agent_model} runs tools; ${definition.finalizer_model} writes the final answer.`,
+      `${definition.agent_model} runs tools; ${definition.finalizer_model} audits the full context and agent draft before writing the final answer.`,
     priority: definition.priority ?? 10 + index,
     visibility: "list",
     supported_in_api: true,

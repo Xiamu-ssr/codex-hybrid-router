@@ -5,7 +5,7 @@
 ```text
 Codex -> 本机 127.0.0.1:10100
           ├─ GPT          -> ChatGPT 订阅
-          ├─ external/*   -> 第三方 Responses API
+          ├─ external/*   -> 第三方 Responses / Anthropic API
           └─ hybrid/*     -> GPT 执行工具，第三方模型写最终回复
 ```
 
@@ -44,6 +44,27 @@ CODEX_ROUTER_PROXY_PORT=7890 \
 ```
 
 不传代理变量时直接联网，不会自动继承系统代理。
+
+### 第三方提示词缓存
+
+Codex 自带的 `prompt_cache_key` 会原样保留给单模型 Responses 请求。Claude 需要显式缓存时，可在模型配置中启用 Anthropic 原生路径：
+
+```json
+{
+  "api_protocol": "anthropic_messages",
+  "prompt_cache": { "enabled": true, "ttl": "5m" }
+}
+```
+
+同时在 `external_provider` 配置 `anthropic_base_url`。路由器会为稳定的工具和系统提示设置显式断点，并用 Anthropic 自动缓存断点跟随不断增长的对话前缀。遇到 GPT 原生 compact 时，其给第三方模型使用的可迁移摘要会按稳定前缀复用，避免每轮重写摘要导致缓存失效。`hybrid/*` finalizer 不启用该缓存，以免为低复用请求增加缓存写入费用。
+
+### 上下文压缩边界
+
+- 纯 GPT 会话：请求和 OpenAI 原生 compact 均透传，不生成本地摘要。
+- 第三方会话：供应商不支持 Codex 的原生 compact 时，路由器用 ChatGPT 订阅模型生成可迁移明文摘要。
+- 混合会话：compact 由 GPT Agent 模型走 OpenAI 原生链路，Codex 保存原生 checkpoint；GPT Agent 继续读取原始 checkpoint，只有给第三方 Finalizer 的副本会转换成可迁移摘要。
+
+可迁移摘要用于第三方兼容，不承诺与 OpenAI 原生 compact 零损失等价。需要整个任务端到端都不经过第三方或摘要翻译时，应始终使用纯 GPT 模型。
 
 ## 会修改什么
 

@@ -15,6 +15,13 @@ import {
 } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import WebSocket, { WebSocketServer } from "ws";
+import { AnthropicResponsesBridge } from "./lib/anthropic-responses-bridge.mjs";
+import { appendFinalizerHandoff } from "./lib/finalizer-handoff.mjs";
+import {
+  AsyncLruCache,
+  compactionCacheKey,
+  latestNativeCompactionPrefix,
+} from "./lib/native-compaction-cache.mjs";
 
 const HOST = process.env.CODEX_ROUTER_HOST || "127.0.0.1";
 const PORT = Number(process.env.CODEX_ROUTER_PORT || 10100);
@@ -26,6 +33,7 @@ const CONFIG_PATH =
 const MODEL_CATALOG =
   process.env.CODEX_ROUTER_MODEL_CATALOG || `${CODEX_HOME}/model-catalog.json`;
 const COMPACT_MODEL = process.env.CODEX_ROUTER_COMPACT_MODEL || "gpt-5.6-luna";
+const COMPACT_EFFORT = process.env.CODEX_ROUTER_COMPACT_EFFORT || "max";
 const configuredHybridKeepaliveMs = Number(
   process.env.CODEX_ROUTER_HYBRID_KEEPALIVE_MS || 30_000,
 );
@@ -35,19 +43,13 @@ const HYBRID_KEEPALIVE_MS = Number.isFinite(configuredHybridKeepaliveMs)
 const LOCAL_COMPACTION_PREFIX = "codex-hybrid-summary-v1:";
 const COMPACT_SECRET_PATH = `${CODEX_HOME}/zenmux-router/compact-secret`;
 const EXPECTED_UPSTREAM_CLOSE = Symbol("expected-upstream-close");
-const CLAUDE_FINALIZER_INSTRUCTIONS =
-  "You are the terminal answer model for an already completed Codex agent turn. " +
-  "Independently answer the latest real user request from the supplied instructions, " +
-  "conversation messages, and existing tool results. Do not call, request, or simulate " +
-  "client-side tools. If a server-hosted web_search tool is supplied, use it when fresh " +
-  "external evidence is needed, then finish the same response with a user-facing answer. " +
-  "Do not mention this handoff or another model. Do not invent work or evidence that is " +
-  "absent from the supplied context or your own web search. Return exactly one final answer.";
+const nativeCompactionBridgeCache = new AsyncLruCache(64);
 
 const DEFAULT_ROUTER_CONFIG = {
   external_provider: {
     name: "ZenMux",
     base_url: "https://zenmux.ai/api/v1",
+    anthropic_base_url: "https://zenmux.ai/api/anthropic",
     api_key_env: "ZENMUX_API_KEY",
     keychain_service: "dev.codex-hybrid-router.zenmux",
     keychain_account: os.userInfo().username,
@@ -59,6 +61,8 @@ const DEFAULT_ROUTER_CONFIG = {
     "zenmux/claude-opus-5": {
       upstream_model: "claude-opus-5",
       compatibility: "claude",
+      api_protocol: "anthropic_messages",
+      prompt_cache: { enabled: true, ttl: "5m" },
     },
     "zenmux/kimi-k3": {
       upstream_model: "kimi-k3",
@@ -110,6 +114,15 @@ const EXTERNAL_PROVIDER = ROUTER_CONFIG.external_provider;
 const EXTERNAL_BASE_URL = new URL(EXTERNAL_PROVIDER.base_url);
 if (EXTERNAL_BASE_URL.protocol !== "https:") {
   throw new Error("external_provider.base_url must use https://");
+}
+const EXTERNAL_ANTHROPIC_BASE_URL = EXTERNAL_PROVIDER.anthropic_base_url
+  ? new URL(EXTERNAL_PROVIDER.anthropic_base_url)
+  : null;
+if (
+  EXTERNAL_ANTHROPIC_BASE_URL &&
+  EXTERNAL_ANTHROPIC_BASE_URL.protocol !== "https:"
+) {
+  throw new Error("external_provider.anthropic_base_url must use https://");
 }
 const KEYCHAIN_SERVICE = EXTERNAL_PROVIDER.keychain_service;
 const KEYCHAIN_ACCOUNT =
@@ -249,6 +262,8 @@ function classifyModel(model) {
       route: "external",
       upstreamModel: external.upstream_model,
       compatibility: external.compatibility || "generic",
+      apiProtocol: external.api_protocol || "responses",
+      promptCache: external.prompt_cache || null,
     };
   }
   if (
@@ -265,9 +280,26 @@ function requestPath(url) {
   return `${parsed.pathname}${parsed.search}`;
 }
 
+function isExternalRoute(route) {
+  return route === "external" || route === "external_anthropic";
+}
+
 function targetFor(route, incomingPath) {
   const parsed = new URL(incomingPath, `http://${HOST}:${PORT}`);
   const suffix = parsed.pathname.replace(/^\/v1/, "");
+  if (route === "external_anthropic") {
+    if (!EXTERNAL_ANTHROPIC_BASE_URL) {
+      throw new Error(
+        "external_provider.anthropic_base_url is required for anthropic_messages models",
+      );
+    }
+    const basePath = EXTERNAL_ANTHROPIC_BASE_URL.pathname.replace(/\/$/, "");
+    return {
+      hostname: EXTERNAL_ANTHROPIC_BASE_URL.hostname,
+      port: Number(EXTERNAL_ANTHROPIC_BASE_URL.port || 443),
+      path: `${basePath}${parsed.pathname}${parsed.search}`,
+    };
+  }
   if (route === "external") {
     const basePath = EXTERNAL_BASE_URL.pathname.replace(/\/$/, "");
     return {
@@ -298,7 +330,7 @@ function upstreamHeaders(req, route, hostname, bodyLength) {
       continue;
     }
     if (
-      route === "external" &&
+      isExternalRoute(route) &&
       (name === "authorization" ||
         name === "x-api-key" ||
         name === "chatgpt-account-id" ||
@@ -312,7 +344,7 @@ function upstreamHeaders(req, route, hostname, bodyLength) {
 
   headers.host = hostname;
   headers["content-length"] = String(bodyLength);
-  if (route === "external") {
+  if (isExternalRoute(route)) {
     const apiKey = readExternalKey();
     if (EXTERNAL_PROVIDER.send_authorization !== false) {
       headers.authorization = `Bearer ${apiKey}`;
@@ -618,7 +650,18 @@ function hasNativeCompaction(payload) {
   );
 }
 
-function preparePayloadForRoute(payload, selection, originalModel) {
+function isNativeCompactionItem(item) {
+  return isCompactionItem(item) &&
+    typeof item.encrypted_content === "string" &&
+    !decodeLocalCompaction(item.encrypted_content);
+}
+
+function preparePayloadForRoute(
+  payload,
+  selection,
+  originalModel,
+  { preserveAssistantProgress = false } = {},
+) {
   const requestedEffort = payload.reasoning?.effort ?? null;
   payload.model = selection.upstreamModel;
   restoreLocalCompactions(payload);
@@ -632,7 +675,7 @@ function preparePayloadForRoute(payload, selection, originalModel) {
   if (selection.route !== "external") return;
 
   normalizeExternalInput(payload);
-  if (selection.compatibility === "claude") {
+  if (selection.compatibility === "claude" && !preserveAssistantProgress) {
     const removedProgressMessages =
       dropAssistantProgressMessagesInActiveToolLoop(payload);
     if (removedProgressMessages > 0) {
@@ -948,7 +991,7 @@ async function generateExternalCompactionFallback(req, payload, input = payload.
     tools: [],
     tool_choice: "none",
     parallel_tool_calls: false,
-    reasoning: { effort: "medium", summary: "auto" },
+    reasoning: { effort: COMPACT_EFFORT, summary: "auto" },
     store: false,
     stream: true,
     include: [],
@@ -973,13 +1016,22 @@ async function generateExternalCompactionFallback(req, payload, input = payload.
 
 async function bridgeNativeCompactionForExternal(req, payload, sourceModel) {
   if (!hasNativeCompaction(payload)) return;
-  const lastUserIndex = payload.input.findLastIndex(
-    (item) => item?.type === "message" && item?.role === "user",
+  const bridgePrefix = latestNativeCompactionPrefix(
+    payload.input,
+    isNativeCompactionItem,
   );
-  const historyInput = lastUserIndex > 0
-    ? payload.input.slice(0, lastUserIndex)
-    : payload.input;
-  const { summary } = await generateExternalCompactionFallback(req, payload, historyInput);
+  if (!bridgePrefix) return;
+
+  // A native GPT compaction item and everything before it form a stable,
+  // canonical prefix. Summarizing later turns here would both duplicate them
+  // and produce a different checkpoint on every request, invalidating
+  // Anthropic's cumulative prompt-cache hash.
+  const cacheKey = compactionCacheKey(compactionInputForGpt(bridgePrefix));
+  const { value, hit } = await nativeCompactionBridgeCache.getOrCreate(
+    cacheKey,
+    () => generateExternalCompactionFallback(req, payload, bridgePrefix),
+  );
+  const { summary } = value;
 
   let inserted = false;
   const bridged = [];
@@ -999,7 +1051,8 @@ async function bridgeNativeCompactionForExternal(req, payload, sourceModel) {
   }
   payload.input = bridged;
   log(
-    `model=${sourceModel} route=native_compaction_bridge compact_model=${COMPACT_MODEL} status=200`,
+    `model=${sourceModel} route=native_compaction_bridge compact_model=${COMPACT_MODEL} ` +
+      `summary_cache=${hit ? "hit" : "miss"} cache_key=${cacheKey.slice(0, 12)} status=200`,
   );
 }
 
@@ -1165,19 +1218,6 @@ function hybridAgentPayload(payload, selection, originalModel) {
   return agentPayload;
 }
 
-function finalizerWebSearchTools(payload, agentResponse) {
-  const agentUsedWebSearch = agentResponse?.output?.some(
-    (item) => item?.type === "web_search_call",
-  );
-  if (!agentUsedWebSearch) return [];
-
-  const configuredTool = payload.tools?.find(
-    (tool) => tool?.type === "web_search" || tool?.type === "web_search_preview",
-  );
-  if (!configuredTool) return [{ type: "web_search" }];
-  return [{ ...structuredClone(configuredTool), type: "web_search" }];
-}
-
 function claudeFinalizerPayload(payload, selection, originalModel, agentResponse) {
   const finalizerPayload = structuredClone(payload);
   if (Array.isArray(finalizerPayload.input)) {
@@ -1187,16 +1227,6 @@ function claudeFinalizerPayload(payload, selection, originalModel, agentResponse
       (item) => item?.type !== "reasoning" && item?.type !== "compaction_trigger",
     );
   }
-  // Never pass client-executed tools into the terminal model. When GPT used
-  // hosted web search, let Claude repeat that search independently instead of
-  // feeding Claude GPT's terminal prose as pseudo-evidence.
-  finalizerPayload.tools = finalizerWebSearchTools(payload, agentResponse);
-  if (finalizerPayload.tools.length > 0) {
-    finalizerPayload.tool_choice = "required";
-  } else {
-    delete finalizerPayload.tool_choice;
-  }
-  finalizerPayload.parallel_tool_calls = false;
   finalizerPayload.include = [];
   finalizerPayload.store = false;
   finalizerPayload.stream = true;
@@ -1213,28 +1243,19 @@ function claudeFinalizerPayload(payload, selection, originalModel, agentResponse
       compatibility: selection.finalizerCompatibility,
     },
     originalModel,
+    { preserveAssistantProgress: true },
   );
 
-  const originalInstructions = typeof finalizerPayload.instructions === "string"
-    ? finalizerPayload.instructions.trim()
-    : "";
-  finalizerPayload.instructions = originalInstructions
-    ? `${originalInstructions}\n\n${CLAUDE_FINALIZER_INSTRUCTIONS}`
-    : CLAUDE_FINALIZER_INSTRUCTIONS;
-  if (!Array.isArray(finalizerPayload.input)) finalizerPayload.input = [];
-  finalizerPayload.input.push({
-    type: "message",
-    role: "user",
-    content: [
-      {
-        type: "input_text",
-        text:
-          "The agent phase is complete. Independently re-reason over the full context and " +
-          "produce the final answer to the latest real user request now. If web_search is " +
-          "available, perform your own search when needed. Do not request client-side tools.",
-      },
-    ],
-  });
+  const { draftMessages, toolEvidenceItems } = appendFinalizerHandoff(
+    finalizerPayload,
+    agentResponse,
+  );
+  log(
+    `model=${originalModel} route=hybrid_finalizer_handoff ` +
+      `draft_messages=${draftMessages} tool_evidence_items=${toolEvidenceItems} ` +
+      `tools=disabled ` +
+      "assistant_progress=preserved",
+  );
   return finalizerPayload;
 }
 
@@ -1272,8 +1293,16 @@ async function runHybridFinalResponse(
   }
 
   try {
+    const finalizerSourcePayload = structuredClone(payload);
+    if (hasNativeCompaction(finalizerSourcePayload)) {
+      await bridgeNativeCompactionForExternal(
+        req,
+        finalizerSourcePayload,
+        originalModel,
+      );
+    }
     const finalizerPayload = claudeFinalizerPayload(
-      payload,
+      finalizerSourcePayload,
       selection,
       originalModel,
       agentResponse,
@@ -1296,7 +1325,7 @@ async function runHybridFinalResponse(
     log(
       `model=${originalModel} route=hybrid_finalizer agent_model=${selection.upstreamModel} ` +
       `service_tier=${agentPayload.service_tier ?? "default"} ` +
-        `finalizer_web_search=${finalizerPayload.tools.length > 0 ? "enabled" : "disabled"} ` +
+        "finalizer_tools=disabled " +
         `finalizer_model=${selection.finalizerModel} status=200 ` +
         `duration_ms=${Date.now() - started}`,
     );
@@ -1338,6 +1367,47 @@ async function runExternalCompactionFallback(req, res, payload, sourceModel) {
         res,
         502,
         errorBody(`Third-party compaction fallback failed: ${error.message}`, "compact_fallback_failed"),
+      );
+    } else {
+      res.destroy(error);
+    }
+  }
+}
+
+async function runHybridNativeCompaction(req, res, payload, sourceModel, selection) {
+  const started = Date.now();
+  try {
+    const compactPayload = hybridAgentPayload(payload, selection, sourceModel);
+    const body = Buffer.from(JSON.stringify(compactPayload));
+    const upstream = await bufferedForward(req, "chatgpt", body, {
+      method: "POST",
+      incomingPath: "/v1/responses",
+      routingModel: selection.upstreamModel,
+    });
+    if (upstream.statusCode < 200 || upstream.statusCode >= 300) {
+      const detail = upstream.body.toString("utf8").slice(0, 1000);
+      throw new Error(`GPT native compaction returned ${upstream.statusCode}: ${detail}`);
+    }
+    const records = parseSseRecords(upstream.body);
+    sendSseRecordsToHttp(res, records);
+    log(
+      `POST ${requestPath(req.url)} model=${sourceModel} ` +
+        `route=chatgpt_native_compact compact_model=${selection.upstreamModel} ` +
+        `status=200 duration_ms=${Date.now() - started}`,
+    );
+  } catch (error) {
+    log(
+      `POST ${requestPath(req.url)} model=${sourceModel} ` +
+        `route=chatgpt_native_compact error=${error.message}`,
+    );
+    if (!res.headersSent) {
+      sendJson(
+        res,
+        502,
+        errorBody(
+          `Hybrid native compaction failed: ${error.message}`,
+          "hybrid_native_compact_failed",
+        ),
       );
     } else {
       res.destroy(error);
@@ -1393,7 +1463,7 @@ function websocketHeaders(req, route, model = null) {
       continue;
     }
     if (
-      route === "external" &&
+      isExternalRoute(route) &&
       (name === "authorization" ||
         name === "x-api-key" ||
         name === "chatgpt-account-id" ||
@@ -1404,7 +1474,7 @@ function websocketHeaders(req, route, model = null) {
     }
     headers[rawName] = rawValue;
   }
-  if (route === "external") {
+  if (isExternalRoute(route)) {
     const apiKey = readExternalKey();
     if (EXTERNAL_PROVIDER.send_authorization !== false) {
       headers.authorization = `Bearer ${apiKey}`;
@@ -1501,6 +1571,382 @@ function rewriteExternalWebSocketEvent(data) {
   } catch {
     return data;
   }
+}
+
+function anthropicRequestForRoute(payload, selection, originalModel) {
+  preparePayloadForRoute(payload, selection, originalModel);
+  delete payload.type;
+  delete payload.previous_response_id;
+  delete payload.generate;
+  payload.stream = true;
+
+  const promptCacheEnabled = selection.promptCache?.enabled === true;
+  const bridge = new AnthropicResponsesBridge(payload, {
+    promptCache: promptCacheEnabled,
+    cacheTtl: selection.promptCache?.ttl || "5m",
+  });
+  bridge.request.stream = true;
+  log(
+    `model=${originalModel} route=external_anthropic ` +
+      `prompt_cache=${promptCacheEnabled ? "automatic+stable-prefix" : "disabled"} ` +
+      `cache_breakpoints=${bridge.cacheBreakpoints} ` +
+      `openai_cache_key=${typeof payload.prompt_cache_key === "string" ? "present" : "absent"}`,
+  );
+  return bridge;
+}
+
+function parseSseJson(block) {
+  const data = sseData(block);
+  if (!data || data === "[DONE]") return null;
+  return JSON.parse(data);
+}
+
+function streamAnthropicMessagesToWebSocket(
+  req,
+  socket,
+  payload,
+  originalModel,
+  selection,
+) {
+  return new Promise((resolve) => {
+    let bridge;
+    let body;
+    let target;
+    let headers;
+    try {
+      bridge = anthropicRequestForRoute(payload, selection, originalModel);
+      body = Buffer.from(JSON.stringify(bridge.request));
+      target = targetFor("external_anthropic", "/v1/messages");
+      headers = upstreamHeaders(
+        req,
+        "external_anthropic",
+        target.hostname,
+        body.length,
+      );
+    } catch (error) {
+      sendWebSocketError(socket, 503, error.message, "external_request_setup_failed");
+      resolve();
+      return;
+    }
+
+    headers.accept = "text/event-stream";
+    headers["accept-encoding"] = "identity";
+    headers["content-type"] = "application/json";
+    headers["anthropic-version"] ||= "2023-06-01";
+    const started = Date.now();
+    let upstream;
+    let finished = false;
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      socket.off("close", closeHandler);
+      resolve();
+    };
+    const fail = (error, code = "external_request_failed") => {
+      if (finished) return;
+      log(
+        `WS /v1/responses model=${originalModel} ` +
+          `route=external_anthropic error=${error.message} ` +
+          `duration_ms=${Date.now() - started}`,
+      );
+      if (socket.readyState === WebSocket.OPEN) {
+        sendWebSocketError(socket, 502, error.message, code);
+      }
+      upstream?.destroy();
+      finish();
+    };
+    const closeHandler = () => {
+      upstream?.destroy();
+      finish();
+    };
+
+    upstream = https.request(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        method: "POST",
+        path: target.path,
+        headers,
+        agent: upstreamHttpsAgent,
+      },
+      (upstreamRes) => {
+        const statusCode = upstreamRes.statusCode || 502;
+        if (statusCode < 200 || statusCode >= 300) {
+          const chunks = [];
+          upstreamRes.on("data", (chunk) => chunks.push(chunk));
+          upstreamRes.once("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              parsed = null;
+            }
+            const message =
+              parsed?.error?.message ||
+              raw.slice(0, 1000) ||
+              `Anthropic endpoint returned ${statusCode}`;
+            if (socket.readyState === WebSocket.OPEN) {
+              sendWebSocketError(
+                socket,
+                statusCode,
+                message,
+                parsed?.error?.type || "external_request_failed",
+              );
+            }
+            log(
+              `WS /v1/responses model=${originalModel} ` +
+                `route=external_anthropic status=${statusCode} ` +
+                `duration_ms=${Date.now() - started}`,
+            );
+            finish();
+          });
+          return;
+        }
+
+        const decoder = new StringDecoder("utf8");
+        let pending = "";
+        const emitBlock = (block) => {
+          const event = parseSseJson(block);
+          if (!event) return;
+          if (event.type === "message_start") {
+            cacheReadTokens = event.message?.usage?.cache_read_input_tokens || 0;
+            cacheWriteTokens = event.message?.usage?.cache_creation_input_tokens || 0;
+          }
+          for (const converted of bridge.convertEvent(event)) {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify(converted));
+            }
+          }
+        };
+        const flush = (final = false) => {
+          while (true) {
+            const separator = pending.match(/\r?\n\r?\n/);
+            if (!separator || separator.index == null) break;
+            const block = pending.slice(0, separator.index);
+            pending = pending.slice(separator.index + separator[0].length);
+            emitBlock(block);
+          }
+          if (final && pending.trim()) {
+            emitBlock(pending);
+            pending = "";
+          }
+        };
+        upstreamRes.on("data", (chunk) => {
+          if (finished) return;
+          try {
+            pending += decoder.write(chunk);
+            flush();
+          } catch (error) {
+            fail(error, "anthropic_stream_conversion_failed");
+          }
+        });
+        upstreamRes.once("end", () => {
+          if (finished) return;
+          try {
+            pending += decoder.end();
+            flush(true);
+          } catch (error) {
+            fail(error, "anthropic_stream_conversion_failed");
+            return;
+          }
+          log(
+            `WS /v1/responses model=${originalModel} ` +
+              `upstream_model=${selection.upstreamModel} ` +
+              `route=external_anthropic status=${statusCode} ` +
+              `cache_read_tokens=${cacheReadTokens} ` +
+              `cache_write_tokens=${cacheWriteTokens} ` +
+              `duration_ms=${Date.now() - started}`,
+          );
+          finish();
+        });
+      },
+    );
+    socket.once("close", closeHandler);
+    upstream.setTimeout(360_000, () => upstream.destroy(new Error("upstream timed out")));
+    upstream.once("error", (error) => fail(error));
+    upstream.end(body);
+  });
+}
+
+function streamAnthropicMessagesToHttp(
+  req,
+  res,
+  payload,
+  originalModel,
+  selection,
+) {
+  return new Promise((resolve) => {
+    let bridge;
+    let body;
+    let target;
+    let headers;
+    try {
+      bridge = anthropicRequestForRoute(payload, selection, originalModel);
+      body = Buffer.from(JSON.stringify(bridge.request));
+      target = targetFor("external_anthropic", "/v1/messages");
+      headers = upstreamHeaders(
+        req,
+        "external_anthropic",
+        target.hostname,
+        body.length,
+      );
+    } catch (error) {
+      sendJson(res, 503, errorBody(error.message, "external_request_setup_failed"));
+      resolve();
+      return;
+    }
+
+    headers.accept = "text/event-stream";
+    headers["accept-encoding"] = "identity";
+    headers["content-type"] = "application/json";
+    headers["anthropic-version"] ||= "2023-06-01";
+    const started = Date.now();
+    let upstream;
+    let finished = false;
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      res.off("close", closeHandler);
+      resolve();
+    };
+    const fail = (error, code = "external_request_failed") => {
+      if (finished) return;
+      log(
+        `POST /v1/responses model=${originalModel} ` +
+          `route=external_anthropic error=${error.message} ` +
+          `duration_ms=${Date.now() - started}`,
+      );
+      upstream?.destroy();
+      if (!res.headersSent) {
+        sendJson(res, 502, errorBody(error.message, code));
+      } else {
+        res.destroy(error);
+      }
+      finish();
+    };
+    const closeHandler = () => {
+      upstream?.destroy();
+      finish();
+    };
+
+    upstream = https.request(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        method: "POST",
+        path: target.path,
+        headers,
+        agent: upstreamHttpsAgent,
+      },
+      (upstreamRes) => {
+        const statusCode = upstreamRes.statusCode || 502;
+        if (statusCode < 200 || statusCode >= 300) {
+          const chunks = [];
+          upstreamRes.on("data", (chunk) => chunks.push(chunk));
+          upstreamRes.once("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed;
+            try {
+              parsed = JSON.parse(raw);
+            } catch {
+              parsed = null;
+            }
+            const message =
+              parsed?.error?.message ||
+              raw.slice(0, 1000) ||
+              `Anthropic endpoint returned ${statusCode}`;
+            if (!res.headersSent) {
+              sendJson(
+                res,
+                statusCode,
+                errorBody(
+                  message,
+                  parsed?.error?.type || "external_request_failed",
+                ),
+              );
+            }
+            log(
+              `POST /v1/responses model=${originalModel} ` +
+                `route=external_anthropic status=${statusCode} ` +
+                `duration_ms=${Date.now() - started}`,
+            );
+            finish();
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache",
+        });
+        const decoder = new StringDecoder("utf8");
+        let pending = "";
+        const emitBlock = (block) => {
+          const event = parseSseJson(block);
+          if (!event) return;
+          if (event.type === "message_start") {
+            cacheReadTokens = event.message?.usage?.cache_read_input_tokens || 0;
+            cacheWriteTokens = event.message?.usage?.cache_creation_input_tokens || 0;
+          }
+          for (const converted of bridge.convertEvent(event)) {
+            const eventName = converted.type || "message";
+            res.write(`event: ${eventName}\ndata: ${JSON.stringify(converted)}\n\n`);
+          }
+        };
+        const flush = (final = false) => {
+          while (true) {
+            const separator = pending.match(/\r?\n\r?\n/);
+            if (!separator || separator.index == null) break;
+            const block = pending.slice(0, separator.index);
+            pending = pending.slice(separator.index + separator[0].length);
+            emitBlock(block);
+          }
+          if (final && pending.trim()) {
+            emitBlock(pending);
+            pending = "";
+          }
+        };
+        upstreamRes.on("data", (chunk) => {
+          if (finished) return;
+          try {
+            pending += decoder.write(chunk);
+            flush();
+          } catch (error) {
+            fail(error, "anthropic_stream_conversion_failed");
+          }
+        });
+        upstreamRes.once("end", () => {
+          if (finished) return;
+          try {
+            pending += decoder.end();
+            flush(true);
+          } catch (error) {
+            fail(error, "anthropic_stream_conversion_failed");
+            return;
+          }
+          res.end();
+          log(
+            `POST /v1/responses model=${originalModel} ` +
+              `upstream_model=${selection.upstreamModel} ` +
+              `route=external_anthropic status=${statusCode} ` +
+              `cache_read_tokens=${cacheReadTokens} ` +
+              `cache_write_tokens=${cacheWriteTokens} ` +
+              `duration_ms=${Date.now() - started}`,
+          );
+          finish();
+        });
+      },
+    );
+    res.once("close", closeHandler);
+    upstream.setTimeout(360_000, () => upstream.destroy(new Error("upstream timed out")));
+    upstream.once("error", (error) => fail(error));
+    upstream.end(body);
+  });
 }
 
 function streamExternalHttpToWebSocket(req, socket, payload, originalModel, selection) {
@@ -1708,6 +2154,23 @@ function handleLocalWebSocket(socket, req) {
       }
 
       if (isRemoteCompactionV2(payload)) {
+        if (selection.route === "hybrid_final") {
+          const compactPayload = hybridAgentPayload(
+            payload,
+            selection,
+            originalModel,
+          );
+          compactPayload.type = "response.create";
+          const compactText = JSON.stringify(compactPayload);
+          const upstream = await getChatgptSocket(selection.upstreamModel);
+          log(
+            `WS /v1/responses model=${originalModel} ` +
+              `route=chatgpt_native_compact compact_model=${selection.upstreamModel} ` +
+              `request_bytes=${Buffer.byteLength(compactText)}`,
+          );
+          upstream.send(compactText);
+          return;
+        }
         const started = Date.now();
         try {
           const { summary, responseId, usage } =
@@ -1725,7 +2188,7 @@ function handleLocalWebSocket(socket, req) {
         return;
       }
 
-      if (hasNativeCompaction(payload)) {
+      if (selection.route === "external" && hasNativeCompaction(payload)) {
         try {
           await bridgeNativeCompactionForExternal(req, payload, originalModel);
         } catch (error) {
@@ -1781,7 +2244,23 @@ function handleLocalWebSocket(socket, req) {
         return;
       }
 
-      await streamExternalHttpToWebSocket(req, socket, payload, originalModel, selection);
+      if (selection.apiProtocol === "anthropic_messages") {
+        await streamAnthropicMessagesToWebSocket(
+          req,
+          socket,
+          payload,
+          originalModel,
+          selection,
+        );
+      } else {
+        await streamExternalHttpToWebSocket(
+          req,
+          socket,
+          payload,
+          originalModel,
+          selection,
+        );
+      }
     }).catch((error) => {
       log(`WS /v1/responses handler_error=${error.stack || error.message}`);
       sendWebSocketError(socket, 502, error.message);
@@ -1869,17 +2348,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   const originalModel = payload.model;
-  if (
-    (selection.route === "external" || selection.route === "hybrid_final") &&
-    isRemoteCompactionV2(payload)
-  ) {
+  if (selection.route === "hybrid_final" && isRemoteCompactionV2(payload)) {
+    await runHybridNativeCompaction(
+      req,
+      res,
+      payload,
+      originalModel,
+      selection,
+    );
+    return;
+  }
+  if (selection.route === "external" && isRemoteCompactionV2(payload)) {
     await runExternalCompactionFallback(req, res, payload, originalModel);
     return;
   }
-  if (
-    (selection.route === "external" || selection.route === "hybrid_final") &&
-    hasNativeCompaction(payload)
-  ) {
+  if (selection.route === "external" && hasNativeCompaction(payload)) {
     try {
       await bridgeNativeCompactionForExternal(req, payload, originalModel);
     } catch (error) {
@@ -1910,6 +2393,16 @@ const server = http.createServer(async (req, res) => {
         errorBody(`Hybrid final response failed: ${error.message}`, "hybrid_final_failed"),
       );
     }
+    return;
+  }
+  if (selection.apiProtocol === "anthropic_messages") {
+    await streamAnthropicMessagesToHttp(
+      req,
+      res,
+      payload,
+      originalModel,
+      selection,
+    );
     return;
   }
   preparePayloadForRoute(payload, selection, originalModel);

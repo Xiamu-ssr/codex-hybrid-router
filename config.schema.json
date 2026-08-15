@@ -13,6 +13,7 @@
       "properties": {
         "name": { "type": "string", "minLength": 1 },
         "base_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "anthropic_base_url": { "type": "string", "format": "uri", "pattern": "^https://" },
         "api_key_env": { "type": "string" },
         "keychain_service": { "type": "string" },
         "keychain_account": { "type": "string" },
@@ -59,7 +60,17 @@
           "required": ["upstream_model"],
           "properties": {
             "upstream_model": { "type": "string", "minLength": 1 },
-            "compatibility": { "enum": ["generic", "claude", "kimi", "grok"] }
+            "compatibility": { "enum": ["generic", "claude", "kimi", "grok"] },
+            "api_protocol": { "enum": ["responses", "anthropic_messages"] },
+            "prompt_cache": {
+              "type": "object",
+              "required": ["enabled"],
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "ttl": { "enum": ["5m", "1h"] }
+              },
+              "additionalProperties": false
+            }
           }
         }
       ]

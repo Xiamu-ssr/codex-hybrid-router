@@ -4,6 +4,7 @@
   "external_provider": {
     "name": "ZenMux",
     "base_url": "https://zenmux.ai/api/v1",
+    "anthropic_base_url": "https://zenmux.ai/api/anthropic",
     "api_key_env": "ZENMUX_API_KEY",
     "keychain_service": "dev.codex-hybrid-router.zenmux",
     "send_authorization": true,
@@ -14,6 +15,8 @@
     "zenmux/claude-opus-5": {
       "upstream_model": "claude-opus-5",
       "compatibility": "claude",
+      "api_protocol": "anthropic_messages",
+      "prompt_cache": { "enabled": true, "ttl": "5m" },
       "display_name": "Claude Opus 5 · ZenMux",
       "description": "Claude Opus 5 through ZenMux.",
       "context_window": 512000,
@@ -55,7 +58,7 @@
       "finalizer_model": "claude-opus-5",
       "finalizer_compatibility": "claude",
       "display_name": "GPT-5.6 Sol · Claude Final",
-      "description": "GPT-5.6 Sol runs tools; Claude Opus 5 independently writes the final answer.",
+      "description": "GPT-5.6 Sol runs tools; Claude Opus 5 audits the complete context and Sol draft before writing the final answer.",
       "context_window": 300000,
       "max_context_window": 300000,
       "auto_compact_token_limit": 268000

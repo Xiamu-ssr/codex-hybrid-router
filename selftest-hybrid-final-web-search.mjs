@@ -56,8 +56,8 @@ for (const block of body.split(/\r?\n\r?\n/)) {
   if (event.type === "response.completed") completedId = event.response?.id;
 }
 
-if (!outputTypes.includes("web_search_call")) {
-  throw new Error(`Claude finalizer did not perform web search: ${outputTypes.join(",")}`);
+if (outputTypes.includes("web_search_call")) {
+  throw new Error(`Claude finalizer unexpectedly repeated web search: ${outputTypes.join(",")}`);
 }
 if (!outputTypes.includes("message") || !text.trim()) {
   throw new Error(`Claude finalizer returned no final message: ${outputTypes.join(",")}`);
@@ -65,4 +65,4 @@ if (!outputTypes.includes("message") || !text.trim()) {
 if (completedId !== "") {
   throw new Error(`hybrid web-search response id was not cleared: ${completedId}`);
 }
-process.stdout.write("hybrid_claude_independent_web_search_final_ok\n");
+process.stdout.write("hybrid_claude_final_without_second_search_ok\n");

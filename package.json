@@ -9,12 +9,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node test/smoke.mjs",
-    "check": "node --check router.mjs && node --check update-model-catalog.mjs && node --check scripts/patch-codex-config.mjs && node --check scripts/write-launch-agent.mjs",
+    "test": "node test/anthropic-cache.mjs && node test/native-compaction-cache.mjs && node test/finalizer-handoff.mjs && node test/smoke.mjs",
+    "check": "node --check router.mjs && node --check lib/anthropic-responses-bridge.mjs && node --check lib/native-compaction-cache.mjs && node --check lib/finalizer-handoff.mjs && node --check update-model-catalog.mjs && node --check scripts/patch-codex-config.mjs && node --check scripts/write-launch-agent.mjs",
     "install:macos": "./scripts/install-macos.sh",
     "key:macos": "./scripts/store-key-macos.sh"
   },
   "dependencies": {
+    "@zenmux/rosetta-ai": "1.0.16",
     "ws": "8.21.3"
   }
 }
